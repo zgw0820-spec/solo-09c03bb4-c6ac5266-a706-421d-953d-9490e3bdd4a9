@@ -1,0 +1,23 @@
+# ZNS 索引回收服务：4 个模拟写区（每区 32 个 4 KiB 块，便于演示），
+# 1 个保留区用于 GC 周转；数据落在命名卷 zns-data 上，容器重启/被杀后
+# 已确认的写入保留，未完成的回收可重试。
+services:
+  zns-gc:
+    build: .
+    image: zns-gc-service
+    ports:
+      - "8000:8000"
+    environment:
+      DATA_DIR: /data
+      ZONE_COUNT: "4"
+      ZONE_CAPACITY_BYTES: "131072"   # 128 KiB = 32 块/区，方便在 Swagger 里快速写满
+      RESERVED_FREE_ZONES: "1"        # 留一个区周转
+      GC_STEP_DELAY_MS: "0"           # 演示搬迁中覆写时可调大（如 200）
+      READ_DELAY_MS: "0"
+      JOURNAL_CHECKPOINT_OPS: "1024"
+    volumes:
+      - zns-data:/data
+    restart: unless-stopped
+
+volumes:
+  zns-data:
