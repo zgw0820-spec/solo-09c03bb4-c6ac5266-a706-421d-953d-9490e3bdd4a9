@@ -14,7 +14,15 @@ from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
 from .config import BLOCK_SIZE, Config
-from .storage import GcBusyError, NoGcCandidateError, NoSpaceError, ZnsStorage
+from .storage import (
+    ExpansionConflictError,
+    ExpansionFailedError,
+    ExpansionInProgressError,
+    GcBusyError,
+    NoGcCandidateError,
+    NoSpaceError,
+    ZnsStorage,
+)
 
 
 def _seeded_block(seed: str) -> bytes:
@@ -137,8 +145,44 @@ async def list_zones(request: Request):
     return {
         "block_size": BLOCK_SIZE,
         "zone_capacity": st.cfg.zone_capacity,
+        "enabled_zone_count": st.enabled_count,
         "zones": st.zone_stats(),
     }
+
+
+class ExpandReq(BaseModel):
+    target_zone_count: int = Field(
+        ge=2,
+        description="扩容后的写区（已启用区）总数；不能小于当前已启用区数，重复提交相同值不会多加区",
+    )
+
+
+@app.post(
+    "/zones/expand",
+    summary="在线扩容：准备新区（旧区照常读写/回收）→ 全部备妥后一次开放给写入分配",
+    responses={
+        400: {"description": "目标区数小于当前已启用区数（不支持缩容），或准备失败后未启用区已回滚"},
+        409: {"description": "已有扩容在进行，或目标与崩溃遗留的在途扩容目标冲突"},
+        507: {"description": "新区准备失败（如磁盘空间不足）；未启用区不参与分配，旧区不受影响"},
+    },
+)
+async def expand_zones(body: ExpandReq, request: Request):
+    st = _st(request)
+    try:
+        return await st.expand(body.target_zone_count)
+    except ExpansionInProgressError as e:
+        raise HTTPException(409, str(e))
+    except ExpansionConflictError as e:
+        raise HTTPException(409, str(e))
+    except ExpansionFailedError as e:
+        raise HTTPException(507, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/zones/expand/status", summary="扩容状态：已启用区数、在途目标与 PREPARING 区清单")
+async def expand_status(request: Request):
+    return _st(request).expand_status()
 
 
 class GcReq(BaseModel):
@@ -159,8 +203,8 @@ class GcReq(BaseModel):
 )
 async def run_gc(body: GcReq, request: Request):
     st = _st(request)
-    if body.zone is not None and not 0 <= body.zone < st.cfg.zone_count:
-        raise HTTPException(400, f"区编号须在 [0, {st.cfg.zone_count}) 内")
+    if body.zone is not None and not 0 <= body.zone < st.enabled_count:
+        raise HTTPException(400, f"区编号须在已启用区 [0, {st.enabled_count}) 内")
     try:
         return await st.gc(body.zone)
     except GcBusyError:

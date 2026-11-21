@@ -6,6 +6,10 @@
   2. overwrite_during_gc —— 搬迁进行中覆写同一些块，搬来的旧副本不得生效
   3. crash_restart       —— SIGKILL 后已确认写入保留；GC 中途被杀可重试；再次崩溃恢复
   4. read_blocks_reset   —— 复位必须等待在途读者结束
+  5. uncommitted_tail    —— 未确认的追加尾巴重启后被截除
+  6. online_expand       —— 在线扩容：准备期旧区照常写、PREPARING 不参与分配、
+                            一次开放、幂等 no-op、扩容后容量与保留区语义、GC 兼容
+  7. expand_interrupt    —— 扩容启用前中断 / 写入新区后再中断：续做、回滚与持久化
 
 运行：.venv/bin/python tests/selftest.py
 """
@@ -400,6 +404,188 @@ def scenario_uncommitted_tail(c: httpx.Client, srv: "Server", data_dir: str, env
             s.stop()
 
 
+# ---------------------------------------------------------------- 场景 6
+
+def scenario_online_expand(c: httpx.Client, srv: "Server", data_dir: str, env: dict):
+    expected: dict[int, int] = {}
+    put_many(c, expected, range(0, 40), 1)  # zone0 满，zone1 有 8 块
+
+    # 准备期并发写：扩容期间旧区读写照常（每个新区一个关键段，块间让出循环）
+    written_during: dict[int, int] = {}
+
+    def keep_writing():
+        for lba in range(2000, 2030):
+            try:
+                put(client(), lba, 1)
+                written_during[lba] = 1
+            except Exception:  # noqa: BLE001 扩容极快，个别失败不影响主断言
+                pass
+
+    t = threading.Thread(target=keep_writing)
+    t.start()
+    rep = c.post("/zones/expand", json={"target_zone_count": 6}).json()
+    t.join()
+    assert rep["status"] == "expanded" and rep["resumed"] is False and rep["new_zones"] == 2, rep
+    expected.update(written_during)
+    print("  PASS 扩容 4→6：新区沿用原容量/预留数，准备期旧区写入不中断")
+
+    # 实际区数：/zones 6 个、全部 enabled、无 PREPARING
+    zs = zones(c)
+    assert len(zs) == 6 and all(z["enabled"] for z in zs), zs
+    st = c.get("/stats").json()
+    assert st["zone_count"] == 6 and st["total_zone_count"] == 6
+    assert st["total_capacity"] == 6 * ZONE_CAP and st["reserved_free_zones"] == 1
+    assert c.get("/zones/expand/status").json()["preparing_zones"] == []
+    print("  PASS 扩容后实际区数=6，容量与周转预留数沿用原配置")
+
+    # 幂等：重复同一目标 no-op，不多加区
+    rep = c.post("/zones/expand", json={"target_zone_count": 6}).json()
+    assert rep["status"] == "noop" and rep["new_zones"] == 0, rep
+    assert len(zones(c)) == 6
+    # 缩容拒绝
+    assert c.post("/zones/expand", json={"target_zone_count": 5}).status_code == 400
+    # 非法目标（< 2）被 pydantic 挡下
+    assert c.post("/zones/expand", json={"target_zone_count": 1}).status_code == 422
+    print("  PASS 重复目标 no-op 不加区；缩容 400；非法目标 422")
+
+    # 继续扩容到 8，并写入直到新区承接分配
+    rep = c.post("/zones/expand", json={"target_zone_count": 8}).json()
+    assert rep["new_zones"] == 2 and rep["target_zone_count"] == 8, rep
+    # 回收已有的纯垃圾/混合满区，给后续滚动写入腾出空间（GC 与扩容共存验证）
+    for zid in [z["id"] for z in zones(c) if z["state"] == "FULL"]:
+        r = c.post("/gc", json={"zone": zid})
+        assert r.status_code == 200, r.text
+    # 持续写直到触及 zone6/zone7（8 区扣 1 保留，容量充足）
+    touched = set()
+    lba = 3000
+    for _ in range(6 * ZONE_BLOCKS):
+        r = c.put(f"/blocks/{lba}", content=payload(lba, 1))
+        if r.status_code == 507:
+            break
+        assert r.status_code == 200, r.text
+        touched.add(r.json()["zone"])
+        expected[lba] = 1
+        lba += 1
+    assert touched & {6, 7}, f"新区未承接写入: {sorted(touched)}"
+    verify_all(c, expected)
+    print(f"  PASS 二次扩容到 8，新区承接写入（触及区 {sorted(touched)}），数据一致")
+
+    # GC 兼容：再回收一个满区（含新区编号），复位后回到 FREE
+    full_now = [z["id"] for z in zones(c) if z["state"] == "FULL"]
+    assert full_now, "持续写后应存在满区"
+    victim = full_now[0]
+    rep = c.post("/gc", json={"zone": victim}).json()
+    assert rep["finished"] and zone_state(c, victim) == "FREE", rep
+    verify_all(c, expected)
+    print(f"  PASS 扩容后 GC 正常（回收 zone{victim} 并复位），数据一致")
+
+    # 原配置（ZONE_COUNT=4）重启：已启用的 8 个区与已确认写入全部保留
+    srv.stop()
+    srv2 = Server(data_dir, **env)
+    try:
+        c2 = client()
+        st = c2.get("/stats").json()
+        assert st["zone_count"] == 8 and st["total_zone_count"] == 8, st
+        verify_all(c2, expected)
+        print("  PASS 原配置重启：8 个已启用区与全部已确认写入保留")
+    finally:
+        srv2.stop()
+
+
+# ---------------------------------------------------------------- 场景 7
+
+def scenario_expand_interrupt(c: httpx.Client, srv: "Server", data_dir: str, env: dict):
+    # 本场景自行管理服务生命周期（带崩溃钩子的专用实例）
+    srv.stop()
+    extra: list["Server"] = []
+    try:
+        # —— 中断一：启用前（prepare 中途）崩溃 ——
+        srv_p = Server(data_dir, EXPAND_CRASH_DURING_PREPARE=1, **env)
+        extra.append(srv_p)
+        cp = client()
+        put_many(cp, {}, range(0, 12), 1)
+        try:
+            cp.post("/zones/expand", json={"target_zone_count": 6})
+        except httpx.HTTPError:
+            pass  # 进程 os._exit，连接断开是预期
+        srv_p.kill()
+        extra.remove(srv_p)
+
+        srv_r = Server(data_dir, **env)
+        extra.append(srv_r)
+        cr = client()
+        st = cr.get("/stats").json()
+        assert st["zone_count"] == 4, st  # 已启用区数不变
+        preparing = st["preparing_zones"]
+        assert preparing and all(z >= 4 for z in preparing), st
+        assert st["expand"]["pending_target"] == 6
+        # 未启用区绝不参与分配：新写仍落在 [0,4)
+        for lba in range(100, 110):
+            info = cr.post(f"/blocks/{lba}/generate", json={"seed": "x"}).json()
+            assert info["zone"] < 4, info
+        # 冲突目标 409；同目标续做成功
+        assert cr.post("/zones/expand", json={"target_zone_count": 8}).status_code == 409
+        rep = cr.post("/zones/expand", json={"target_zone_count": 6}).json()
+        assert rep["status"] == "expanded" and rep["resumed"] is True, rep
+        assert cr.get("/stats").json()["zone_count"] == 6
+        print(f"  PASS 启用前中断：PREPARING={preparing} 不参与分配，同目标续做完成")
+
+        # —— 中断二：写入新区后再中断（commit 前崩溃 + 启用后 SIGKILL）——
+        # 先制造一次"备妥未启用"崩溃
+        srv_r.stop()
+        extra.remove(srv_r)
+        srv_q = Server(data_dir, EXPAND_CRASH_BEFORE_COMMIT=1, **env)
+        extra.append(srv_q)
+        cq = client()
+        try:
+            cq.post("/zones/expand", json={"target_zone_count": 8})
+        except httpx.HTTPError:
+            pass
+        srv_q.kill()
+        extra.remove(srv_q)
+
+        srv_s = Server(data_dir, **env)
+        extra.append(srv_s)
+        cs = client()
+        st = cs.get("/stats").json()
+        assert st["zone_count"] == 6 and st["preparing_zones"] == [6, 7], st
+        # 续做启用
+        rep = cs.post("/zones/expand", json={"target_zone_count": 8}).json()
+        assert rep["resumed"] is True and rep["target_zone_count"] == 8, rep
+        # 回收满区腾出滚动空间，再写入直到新区 6/7 承接
+        for zid in [z["id"] for z in zones(cs) if z["state"] == "FULL"]:
+            assert cs.post("/gc", json={"zone": zid}).status_code == 200
+        expected_new: dict[int, int] = {}
+        touched = set()
+        lba = 5000
+        for _ in range(6 * ZONE_BLOCKS):
+            r = cs.put(f"/blocks/{lba}", content=payload(lba, 7))
+            if r.status_code == 507:
+                break
+            touched.add(r.json()["zone"])
+            expected_new[lba] = 7
+            lba += 1
+        assert touched & {6, 7}, touched
+        # 已确认写入落盘后 SIGKILL
+        srv_s.kill()
+        extra.remove(srv_s)
+
+        srv_t = Server(data_dir, **env)
+        extra.append(srv_t)
+        ct = client()
+        st = ct.get("/stats").json()
+        assert st["zone_count"] == 8 and not st["preparing_zones"], st
+        for lba, ver in expected_new.items():
+            assert ct.get(f"/blocks/{lba}").content == payload(lba, ver), lba
+        # 早前的写入也还在
+        for lba in range(0, 12):
+            assert ct.get(f"/blocks/{lba}").status_code == 200
+        print(f"  PASS 写入新区后 SIGKILL：8 区与新区上的 {len(expected_new)} 个确认写入全部保留")
+    finally:
+        for s in extra:
+            s.stop()
+
+
 # ---------------------------------------------------------------- main
 
 def run_scenario(name: str, env: dict, fn):
@@ -420,4 +606,6 @@ if __name__ == "__main__":
     run_scenario("crash_restart", {"GC_STEP_DELAY_MS": 30}, scenario_crash_restart)
     run_scenario("read_blocks_reset", {"GC_STEP_DELAY_MS": 5, "READ_DELAY_MS": 500}, scenario_read_blocks_reset)
     run_scenario("uncommitted_tail", {}, scenario_uncommitted_tail)
+    run_scenario("online_expand", {}, scenario_online_expand)
+    run_scenario("expand_interrupt", {}, scenario_expand_interrupt)
     print(f"\n全部场景通过，耗时 {time.monotonic() - t0:.1f}s")

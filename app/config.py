@@ -19,6 +19,14 @@ class Config:
         self.read_delay_ms = int(os.environ.get("READ_DELAY_MS", "0"))
         # journal 累积多少条操作后做一次快照压缩
         self.journal_checkpoint_ops = int(os.environ.get("JOURNAL_CHECKPOINT_OPS", "1024"))
+        # 测试钩子：扩容"新区备妥、启用记录落盘前"主动退出进程（模拟断电/崩溃）；生产应为 0
+        self.expand_crash_before_commit = os.environ.get(
+            "EXPAND_CRASH_BEFORE_COMMIT", "0"
+        ) not in ("", "0", "false", "False")
+        # 测试钩子：扩容"扩容开始记录落盘后、新区准备中途"主动退出（模拟准备中断）；生产应为 0
+        self.expand_crash_during_prepare = os.environ.get(
+            "EXPAND_CRASH_DURING_PREPARE", "0"
+        ) not in ("", "0", "false", "False")
 
         if self.zone_capacity % BLOCK_SIZE != 0:
             raise ValueError("ZONE_CAPACITY_BYTES 必须是 4096 的整数倍")
